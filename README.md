@@ -42,6 +42,29 @@ flowchart TD
     H --> G
 ```
 
+## Agent Architecture
+
+The agent is organized around a LangGraph orchestration layer and focused
+support modules:
+
+- `app/agent/graph.py` — builds the agent graph and owns execution flow,
+  routing, and state transitions.
+- `app/agent/tools.py` — defines the LangChain tool wrappers exposed to the
+  model.
+- `app/agent/customer_resolution.py` — resolves customer identity and scopes
+  customer-specific arguments.
+- `app/agent/invoice_reconciliation.py` — reconciles persisted invoices with
+  invoice-document evidence.
+- `app/agent/onboarding_verification.py` — reviews onboarding completion and
+  verifies task coverage against requirements.
+- `app/agent/onboarding_write_verification.py` — verifies persisted project and
+  task writes by reading them back.
+- `app/agent/communication_verification.py` — verifies persisted email
+  operations.
+- `app/agent/prompts.py` — stores static prompt definitions.
+- `app/agent/execution_support.py` — provides deterministic execution helpers,
+  including action signatures and skipped-tool-call responses.
+
 ## Try it
 
 | Request | What it demonstrates |
@@ -113,7 +136,9 @@ Last full run: **98 tests passed, 1 skipped** (the live Gmail test is opt-in). T
 - Narrow scope: no browser or GUI control, and the email policy is a small rule set, not authorization or DLP.
 - Simulated company: seeded PostgreSQL data and Markdown documents, no migrations, no authentication on the demo UI.
 - Each tool call starts a short-lived MCP subprocess, which is simple but slow.
-- `graph.py` is large (about 2,800 lines). It holds the graph, nodes, guards and verifiers; splitting it is on the next-steps list.
+- `graph.py` remains the orchestration boundary, while domain-specific
+  verification, tool wrappers, prompts and execution helpers live in focused
+  modules.
 
 ## Assumptions
 
@@ -125,7 +150,8 @@ Last full run: **98 tests passed, 1 skipped** (the live Gmail test is opt-in). T
 
 1. Durable checkpoints and authenticated approvers.
 2. Stronger retrieval with document versioning, plus repeated-trial evaluation of real-model behavior.
-3. Split `graph.py` into prompts, tools, guards, verification and completion modules (an audit and phased plan exist).
+3. Continue reducing coupling in the execution and policy portions of
+   `graph.py` only where a safe, independently testable boundary exists.
 4. Role-, tenant- and data-classification-aware policy, with an auditable approval record.
 5. Combine structured requirement extraction with human review for high-risk contractual interpretation.
 
