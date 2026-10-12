@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Northstar Autonomy Engine</title>
+    <link rel="stylesheet" href="/ui/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header>
+        <div>
+          <p class="eyebrow">ENGINEERING DEMO</p>
+          <h1>Northstar Autonomy Engine</h1>
+          <p class="subtitle">Autonomous business-task execution with observable, verifiable outcomes.</p>
+        </div>
+        <span id="connection" class="pill neutral">Checking API</span>
+      </header>
+
+      <section class="card goal-card" aria-labelledby="goal-heading">
+        <div class="section-heading">
+          <div><p class="eyebrow">NEW RUN</p><h2 id="goal-heading">Describe the outcome</h2></div>
+          <span id="run-status" class="pill neutral">Idle</span>
+        </div>
+        <label for="goal">Natural-language goal</label>
+        <textarea id="goal" rows="4" placeholder="Example: Onboard Globex Corporation LLC."></textarea>
+        <div class="presets" aria-label="Preset scenarios">
+          <button data-goal="Onboard Globex Corporation LLC.">Onboard Globex</button>
+          <button data-goal="Onboard Acme Corp.">Onboard Acme Corp</button>
+          <button data-goal="Onboard Acme.">Onboard Acme (Ambiguous)</button>
+          <button data-goal="Onboard Delta Health.">Onboard Delta</button>
+          <button data-goal="Inspect the latest active invoice for Acme Corporation Inc. Verify it against the persisted internal record and report verification evidence. Do not create or modify records.">Process Invoice</button>
+        </div>
+        <div class="actions"><button id="start" class="primary">Start execution</button><span id="form-error" role="alert"></span></div>
+      </section>
+
+      <section class="grid">
+        <section class="card trace-card" aria-labelledby="trace-heading">
+          <div class="section-heading"><div><p class="eyebrow">OBSERVABLE EXECUTION</p><h2 id="trace-heading">Live trace</h2></div><span id="run-id" class="muted">No active run</span></div>
+          <ol id="events" class="events" aria-live="polite"><li class="empty">Start a run to view real graph events.</li></ol>
+        </section>
+
+        <aside class="stack">
+          <section class="card" aria-labelledby="evidence-heading">
+            <p class="eyebrow">RETRIEVED EVIDENCE</p><h2 id="evidence-heading">Evidence &amp; Context</h2>
+            <div id="evidence" class="evidence"><p class="muted">No documents retrieved yet.</p></div>
+          </section>
+          <section id="intervention" class="card hidden" aria-labelledby="intervention-heading">
+            <p class="eyebrow">HUMAN INPUT REQUIRED</p><h2 id="intervention-heading">Review and continue</h2>
+            <p id="intervention-message"></p>
+            <pre id="pending-details"></pre>
+            <div id="clarification-controls" class="hidden">
+              <label for="clarification">Clarification</label>
+              <textarea id="clarification" rows="3"></textarea>
+              <button id="submit-clarification" class="primary">Resume with clarification</button>
+            </div>
+            <div id="approval-controls" class="hidden actions">
+              <button id="approve" class="primary">Approve</button>
+              <button id="reject" class="danger">Reject</button>
+            </div>
+            <p id="intervention-error" role="alert"></p>
+          </section>
+
+          <section class="card" aria-labelledby="result-heading">
+            <p class="eyebrow">BACKEND EVIDENCE</p><h2 id="result-heading">Final report</h2>
+            <dl id="report" class="report"><div><dt>Status</dt><dd>Not started</dd></div></dl>
+            <pre id="verification" class="hidden"></pre>
+          </section>
+        </aside>
+      </section>
+    </main>
+    <script src="/ui/app.js"></script>
+  </body>
+</html>
