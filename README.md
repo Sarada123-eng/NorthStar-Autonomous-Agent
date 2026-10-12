@@ -416,6 +416,10 @@ The CLI remains available independently through `python -m app.main ...`.
 | How are MCP subprocesses called? | [`app/agent/mcp_client.py`](app/agent/mcp_client.py) |
 | How is retrieval scored? | [`app/retrieval/lexical.py`](app/retrieval/lexical.py) |
 | What is persisted and seeded? | [`app/database.py`](app/database.py) |
+| How are policy decisions made? | [`app/policy/communication.py`](app/policy/communication.py) |
+| How are diagnostics sanitized? | [`app/agent/diagnostics.py`](app/agent/diagnostics.py) |
+| What documents drive the demo? | [`company_data/`](company_data) |
+| What behavior is tested? | [`tests/`](tests) |
 
 ## Public-release notes
 
@@ -506,6 +510,23 @@ $env:COMMUNICATION_BACKEND = "mock"
 Open `http://127.0.0.1:8000`. The frontend has no build step. The MCP
 processes are child stdio processes of the CLI/API process.
 
+### HTTP API surface
+
+The FastAPI adapter exposes:
+
+- `GET /api/health` for a process health check.
+- `POST /api/runs` to start a run; `goal` and an idempotency
+  `submission_id` are required.
+- `GET /api/runs/{run_id}` for the sanitized run report.
+- `GET /api/runs/{run_id}/events` for replayable SSE events, with optional
+  `after` query parameter or `Last-Event-ID` header.
+- `POST /api/runs/{run_id}/clarification` to resume a clarification interrupt.
+- `POST /api/runs/{run_id}/approval` with `approve` or `reject` to resume an
+  approval interrupt.
+
+Run records, submission deduplication, checkpoints, and event history are
+in-memory and process-local.
+
 ### Tests and reproducibility
 
 The supported test runner is Python `unittest`; tests do not require a live
@@ -519,9 +540,14 @@ $env:COMMUNICATION_BACKEND = "mock"
 
 The focused release-regression run covering the UI/API evidence flow,
 onboarding completion, and invoice reconciliation completed successfully:
-**54 tests, 0 failures, 0 errors**. The full suite was not rerun during this
-release-preparation pass; the previously observed full-suite communication
-errors remain documented below.
+**67 tests, 0 failures, 0 errors**. This included UI/API evidence handling,
+onboarding completion, invoice reconciliation, customer resolution, and
+clarification behavior.
+
+The full discovery suite was started with mock communication selected, but it
+did not complete within approximately four minutes and was stopped. It must
+not be described as passing; no final full-suite count or failure summary is
+claimed here.
 
 Python `3.13` is the currently validated interpreter in this workspace.
 Dependencies are declared in [`requirements.txt`](requirements.txt). There is
@@ -555,9 +581,9 @@ that a user can publish arbitrary logs safely.
 
 The current workspace contains local secret material in ignored files. Rotate
 any credential that has ever been exposed outside the local machine before
-publishing, and verify the release candidate with a secret scanner. Because
-this checkout is not a Git repository, no local Git tracking history or remote
-configuration could be audited here.
+publishing, and verify the release candidate with a secret scanner. The local
+repository has no commit history yet; review the staged file list before the
+first commit.
 
 ### External services and prebuilt components
 
@@ -571,8 +597,4 @@ frameworks/services, not code authored by this project.
 
 No `LICENSE` file or explicit open-source license is present. Do not publish
 the repository as open source until the copyright holder selects and adds an
-appropriate license. [`app/database.py`](app/database.py) |
-| How are policy decisions made? | [`app/policy/communication.py`](app/policy/communication.py) |
-| How are diagnostics sanitized? | [`app/agent/diagnostics.py`](app/agent/diagnostics.py) |
-| What documents drive the demo? | [`company_data/`](company_data) |
-| What behavior is tested? | [`tests/`](tests) |
+appropriate license.
