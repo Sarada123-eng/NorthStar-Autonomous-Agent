@@ -181,3 +181,15 @@ company_data/       demo company, contract, policy and invoice documents
 tests/              unit and async regression tests
 docs/DESIGN.md      design notes and configuration reference
 ```
+
+## Post-Submission Improvements
+
+The `main` branch preserves the original version of the project submitted for
+evaluation.
+
+After submission, I continued working on the project in the
+`refactor/modularize-agent` branch, focusing on improving code organization and
+maintainability by separating agent responsibilities into dedicated modules.
+
+These changes are documented separately from the original submission and are
+not merged into `main`.
