@@ -1,13 +1,10 @@
 import json
 import os
 import re
-from datetime import datetime
-from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -30,6 +27,14 @@ from app.agent.mcp_client import (
     log_invoice as call_log_invoice,
 )
 from app.agent.state import AgentState, RunStatus
+from app.agent import invoice_reconciliation
+from app.agent import onboarding_verification
+from app.agent import communication_verification
+from app.agent import customer_resolution
+from app.agent import execution_support
+from app.agent import onboarding_write_verification
+from app.agent.prompts import COMPLETION_REVIEW_PROMPT, SYSTEM_PROMPT
+from app.agent.tools import build_tools
 from app.policy.communication import (
     ALLOW,
     APPROVAL_REQUIRED,
@@ -59,86 +64,6 @@ SMOKE_READ_ONLY_WRITE_TOOLS = {
     "send_email",
 }
 
-SYSTEM_PROMPT = """You are the Northstar assistant.
-
-You help users interact with Northstar's internal knowledge and
-operational systems.
-
-Use internal tools when the user's request requires information or
-actions involving Northstar's systems.
-
-- Use `search_documents` when the answer depends on internal company
-  policies, SOPs, contracts, invoices, or other company documents.
-- Use `find_customer` when the answer depends on current customer
-  records or operational status.
-- Use `create_customer` when the user explicitly asks to create a
-  customer and provides the required billing and technical contacts.
-- For onboarding an existing or named customer, never use `create_customer`
-  to request contacts. Before an onboarding write, consult the documented
-  onboarding procedure and the resolved customer's governing contract with
-  `search_documents`; then
-  use `find_customer` and inspect onboarding state with `list_projects` and
-  `list_tasks`.
-- Use `list_projects` and `list_tasks` to inspect existing onboarding state
-  before creating project or task records.
-- `customer_id`, `project_id`, and `task_id` identify different entity types.
-  Never use one as another. Obtain a `project_id` from a project result before
-  calling `list_tasks` or `create_task`.
-- `invoice_id` identifies a persisted invoice. Use `list_invoices` to inspect
-  invoice revision relationships, select the active current revision rather
-  than an older superseded invoice, and use `get_invoice` to inspect one ID.
-- Use `log_invoice` only to create or update a real invoice record; never put
-  invoice details into a generic project task title.
-- Use `create_project` and `create_task` for internal onboarding planning
-  actions supported by the discovered requirements.
-- Before `create_task`, inspect the exact project's current tasks with a
-  successful `list_tasks(project_id)` result. This is enforced at runtime.
-- Use `request_clarification` when the available evidence leaves an important
-  identity or requirement genuinely ambiguous. Ask one precise question and
-  do not choose an entity arbitrarily.
-- Use `send_email` when the user explicitly requests an email. It sends or
-  records the email through the configured communication backend.
-- Use `get_email` to inspect the resulting email record.
-- Do not call an email a mock outbox record unless the tool result explicitly
-  identifies the mock backend. Do not claim external delivery merely because
-  `send_email` succeeded.
-- Report verification accurately. A successful verification means the
-  configured backend's resulting email record matched the intended email. If
-  the tool result identifies Gmail/external sending and verification succeeds,
-  you may say it was sent through Gmail and verified. If it identifies the
-  mock backend, say it was recorded in the mock outbox. Never infer the
-  backend from assumptions or prompt text.
-- Communication actions are subject to a runtime policy gate; do not assume
-  that proposing `send_email` means it can execute.
-- Do not use internal tools for general knowledge or simple arithmetic.
-
-When a tool is used, base your answer on the tool result.
-
-A successful tool call is only one completed action or an observation; it
-does not prove that the broader user goal is complete. After each result,
-decide whether more safe work is required. Do not create duplicate
-onboarding projects or tasks when the current state already shows them.
-
-If a tool reports a failure, do not blindly retry the same action. If the
-failure provides enough information for a different, safe corrective action,
-you may replan and use an appropriate available tool. Otherwise, report the
-failure clearly or ask the user for missing information.
-
-If a tool result explicitly marks a failure as retryable and transient, retry
-the same action when appropriate. The runtime enforces the retry limit.
-
-When a customer creation reports a duplicate, investigate the existing
-customer rather than retrying creation. First use `find_customer`, then use
-`search_documents` to compare the available legal name, registration or tax
-identifier, and domain information before deciding whether it can be reused.
-Do not assume that a matching short name means the same legal entity. If the
-identity is different or remains ambiguous, ask for clarification or explain
-that the operation is blocked.
-
-Do not invent missing information. If a required value for an operation
-is missing, ask the user for it."""
-
-
 def get_llm() -> ChatOpenAI:
     return ChatOpenAI(
         model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
@@ -146,122 +71,37 @@ def get_llm() -> ChatOpenAI:
     )
 
 
-@tool
-async def search_documents(query: str) -> str:
-    """Search Northstar policies, SOPs, contracts, invoices, and internal documents.
-
-    Use this for security requirements and all questions about documented
-    company knowledge. Do not use it for current customer records or
-    operational database state.
-    """
-    return await call_search_documents(query)
-
-
-@tool
-async def find_customer(name: str) -> str:
-    """Find a current customer record and status in the Operations database.
-
-    Use this only when the user asks whether a customer exists or asks about
-    current customer status. Never use it for security requirements, policies,
-    contracts, invoices, or other internal documents. After a duplicate
-    creation, this confirms only that a short-name record exists; it does not
-    prove that the requested legal entity is the same. Use
-    search_documents to compare legal name, registration or tax identifier,
-    and domain before reusing that record.
-    """
-    return await call_find_customer(name)
+def _resolve_tool_dependency(name: str):
+    return {
+        "search_documents": call_search_documents,
+        "find_customer": call_find_customer,
+        "create_customer": call_create_customer,
+        "list_projects": call_list_projects,
+        "create_project": call_create_project,
+        "list_tasks": call_list_tasks,
+        "create_task": call_create_task,
+        "list_invoices": call_list_invoices,
+        "get_invoice": call_get_invoice,
+        "log_invoice": call_log_invoice,
+        "send_email": call_send_email,
+        "get_email": call_get_email,
+    }[name]
 
 
-@tool
-async def create_customer(
-    name: str,
-    billing_contact: str,
-    technical_contact: str,
-) -> str:
-    """Create a customer in the Operations database.
-
-    Use only when the user explicitly requests creation and provides the
-    customer's name, billing contact, and technical contact.
-    """
-    return await call_create_customer(name, billing_contact, technical_contact)
-
-
-@tool
-async def list_projects(customer_name: str) -> str:
-    """List existing onboarding projects for a customer before creating one."""
-    return await call_list_projects(customer_name)
-
-
-@tool
-async def create_project(customer_name: str, name: str) -> str:
-    """Create an internal onboarding project for an existing customer."""
-    return await call_create_project(customer_name, name)
-
-
-@tool
-async def list_tasks(project_id: int) -> str:
-    """List existing tasks in an onboarding project before creating tasks."""
-    return await call_list_tasks(project_id)
-
-
-@tool
-async def create_task(project_id: int, title: str) -> str:
-    """Create one internal onboarding task in an existing project."""
-    return await call_create_task(project_id, title)
-
-
-@tool
-async def list_invoices(customer_name: str) -> str:
-    """List a customer's persisted invoices and their revision relationships."""
-    return await call_list_invoices(customer_name)
-
-
-@tool
-async def get_invoice(invoice_id: int) -> str:
-    """Retrieve one persisted invoice by invoice_id for inspection or verification."""
-    return await call_get_invoice(invoice_id)
-
-
-@tool
-async def log_invoice(
-    customer_name: str,
-    invoice_number: str,
-    amount: str,
-    due_date: str,
-    issued_date: str,
-    revision_number: int = 0,
-    status: str = "active",
-    supersedes_invoice_number: str | None = None,
-) -> str:
-    """Create or update an invoice with amount, dates, status, and revision link."""
-    return await call_log_invoice(
-        customer_name,
-        invoice_number,
-        amount,
-        due_date,
-        issued_date,
-        revision_number,
-        status,
-        supersedes_invoice_number,
-    )
-
-
-@tool
-async def send_email(to: str, subject: str, body: str) -> str:
-    """Send or record an email through the configured communication backend."""
-    return await call_send_email(to, subject, body)
-
-
-@tool
-async def get_email(email_id: int) -> str:
-    """Retrieve the resulting email record from the configured backend."""
-    return await call_get_email(email_id)
-
-
-@tool
-def request_clarification(question: str) -> str:
-    """Ask the user for missing or ambiguous information before continuing."""
-    return question
+_TOOLS = build_tools(_resolve_tool_dependency)
+search_documents = _TOOLS["search_documents"]
+find_customer = _TOOLS["find_customer"]
+create_customer = _TOOLS["create_customer"]
+list_projects = _TOOLS["list_projects"]
+create_project = _TOOLS["create_project"]
+list_tasks = _TOOLS["list_tasks"]
+create_task = _TOOLS["create_task"]
+list_invoices = _TOOLS["list_invoices"]
+get_invoice = _TOOLS["get_invoice"]
+log_invoice = _TOOLS["log_invoice"]
+send_email = _TOOLS["send_email"]
+get_email = _TOOLS["get_email"]
+request_clarification = _TOOLS["request_clarification"]
 
 
 async def decide(state: AgentState) -> dict:
@@ -685,33 +525,11 @@ def _explicitly_requests_customer_creation(goal: str) -> bool:
 def _customer_resolution_from_result(
     tool_name: str, result: dict[str, Any]
 ) -> dict[str, Any] | None:
-    if tool_name != "find_customer":
-        return None
-    explicit = result.get("resolution")
-    if isinstance(explicit, dict) and explicit.get("status"):
-        # Operations returns resolution metadata beside the canonical customer
-        # record. Keep both pieces together so later customer-scoped gates can
-        # validate the same identity without re-resolving it.
-        resolved = dict(explicit)
-        customer = result.get("customer")
-        if isinstance(customer, dict) and "customer" not in resolved:
-            resolved["customer"] = customer
-        return resolved
-    if result.get("found") is True and isinstance(result.get("customer"), dict):
-        return {
-            "status": "resolved",
-            "reference": result["customer"].get("name"),
-            "customer": result["customer"],
-        }
-    if result.get("found") is False:
-        return {"status": "not_found"}
-    return {"status": "unresolved"}
+    return customer_resolution.resolution_from_result(tool_name, result)
 
 
 def _normalize_customer_reference(value: str) -> str:
-    """Match the database's legal-name comparison normalization."""
-    cleaned = re.sub(r"[.]+$", "", value.strip())
-    return re.sub(r"\s+", " ", cleaned).casefold()
+    return customer_resolution.normalize_reference(value)
 
 
 def _bind_customer_resolution(
@@ -720,38 +538,15 @@ def _bind_customer_resolution(
     requested_reference: str,
     lookup_result: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """Attach same-run provenance to a successful customer lookup."""
-    if not resolution or resolution.get("status") != "resolved":
-        return resolution
-
-    bound = dict(resolution)
-    customer = bound.get("customer")
-    if not isinstance(customer, dict):
-        customer = lookup_result.get("customer")
-    if isinstance(customer, dict):
-        bound["customer"] = customer
-    bound["run_id"] = state["run_id"]
-    bound["normalized_reference"] = _normalize_customer_reference(
-        requested_reference
+    return customer_resolution.bind_resolution(
+        state, resolution, requested_reference, lookup_result
     )
-    # Preserve the original structured result for a later identical lookup.
-    # It is used only after the run ID and normalized reference also match.
-    bound["lookup_result"] = lookup_result
-    return bound
 
 
 def _customer_reference_for_current_actions(state: AgentState) -> str | None:
-    """Return an explicit customer name requested by the current tool calls."""
-    last_message = state["messages"][-1]
-    if not isinstance(last_message, AIMessage):
-        return _explicit_customer_reference(state["goal"])
-    for tool_call in last_message.tool_calls:
-        if tool_call["name"] not in CUSTOMER_SCOPED_ACTION_TOOLS:
-            continue
-        reference = tool_call["args"].get("customer_name")
-        if isinstance(reference, str) and reference.strip():
-            return reference
-    return _explicit_customer_reference(state["goal"])
+    return customer_resolution.customer_reference_for_current_actions(
+        state, CUSTOMER_SCOPED_ACTION_TOOLS
+    )
 
 
 def _resolution_matches_reference(
@@ -759,200 +554,64 @@ def _resolution_matches_reference(
     resolution: dict[str, Any] | None,
     requested_reference: str | None,
 ) -> bool:
-    """Allow reuse only for a resolved identity from this run and customer."""
-    if (
-        not resolution
-        or resolution.get("status") != "resolved"
-        or resolution.get("run_id") != state["run_id"]
-    ):
-        return False
-    if not requested_reference:
-        return True
-
-    requested = _normalize_customer_reference(requested_reference)
-    known_references = [
-        resolution.get("normalized_reference"),
-        resolution.get("reference"),
-    ]
-    customer = resolution.get("customer")
-    if isinstance(customer, dict):
-        known_references.extend(
-            [customer.get("name"), customer.get("legal_name")]
-        )
-    return any(
-        isinstance(reference, str)
-        and _normalize_customer_reference(reference) == requested
-        for reference in known_references
+    return customer_resolution.resolution_matches_reference(
+        state, resolution, requested_reference
     )
 
 
 def _cached_customer_lookup(
     state: AgentState, customer_name: str
 ) -> str | None:
-    """Return same-run evidence for an identical resolved lookup, if any."""
-    resolution = state.get("customer_resolution")
-    if not _resolution_matches_reference(state, resolution, customer_name):
-        return None
-    lookup_result = resolution.get("lookup_result")
-    if not isinstance(lookup_result, dict) or lookup_result.get("found") is not True:
-        return None
-    return json.dumps(lookup_result)
+    return customer_resolution.cached_lookup(
+        state, customer_name
+    )
 
 
 def _explicit_customer_reference(goal: str) -> str | None:
-    """Extract a likely named customer only when the goal states one.
-
-    Conservative extraction: stop at sentence boundaries ('. ' followed by
-    an uppercase letter or end-of-string) and common clause-boundary words
-    so that multi-sentence goals don't produce garbage customer names.
-    """
-    markers = (
-        r"\bfor\s+(?:the\s+)?",
-        r"\bonboard\s+",
-        r"\bexact\s+legal\s+name\s+",
-        r"\bcustomer\s+(?:named|called)\s+",
-    )
-    # Sentence / clause boundary: period followed by whitespace+uppercase,
-    # or common imperative verbs that start a new instruction.
-    _SENTENCE_BOUNDARY = re.compile(
-        r"[.]\s+(?=[A-Z])"   # period-space-uppercase  (new sentence)
-    )
-    _CLAUSE_BOUNDARY = re.compile(
-        r"\s+(?:verify|confirm|check|do\s+not|report|compare|ensure|retrieve"
-        r"|inspect|and\s+(?:verify|confirm|check|report|do\s+not))\b",
-        flags=re.IGNORECASE,
-    )
-    for marker in markers:
-        matches = list(re.finditer(marker, goal, flags=re.IGNORECASE))
-        if not matches:
-            continue
-        tail = goal[matches[-1].end():]
-        # Truncate at the first sentence boundary
-        sent_match = _SENTENCE_BOUNDARY.search(tail)
-        if sent_match:
-            tail = tail[:sent_match.start()]
-        # Truncate at the first clause boundary
-        clause_match = _CLAUSE_BOUNDARY.search(tail)
-        if clause_match:
-            tail = tail[:clause_match.start()]
-        reference = tail.strip(" .,!?:;")
-        reference = re.sub(
-            r"\s+(?:project|customer|onboarding project)\s*$",
-            "",
-            reference,
-            flags=re.IGNORECASE,
-        ).strip(" .,!?:;")
-        # A single short token such as "Acme" may be an alias shared by
-        # multiple entities; let the normal find_customer/ambiguity path
-        # establish that state instead of guessing from the goal alone.
-        if (
-            reference
-            and " " in reference
-            and re.match(r"[A-Z]", reference)
-        ):
-            return reference
-    return None
+    return customer_resolution.explicit_customer_reference(goal)
 
 
 def _resolution_question(state: AgentState) -> str:
-    for message in reversed(state["messages"]):
-        if isinstance(message, ToolMessage):
-            result = parse_tool_result(message.content)
-            resolution = result.get("resolution")
-            if isinstance(resolution, dict) and resolution.get("status") == "ambiguous":
-                candidates = resolution.get("candidates", [])
-                if candidates:
-                    return (
-                        "I found multiple possible customer entities: "
-                        + "; ".join(str(candidate) for candidate in candidates)
-                        + ". Which one should I use?"
-                    )
-    return (
-        "Which specific customer entity should I use? Please provide the "
-        "customer's full legal name or another distinguishing identifier."
-    )
+    return customer_resolution.resolution_question(state, parse_tool_result)
 
 
 def _blocked_customer_write(
     state: AgentState, tool_call: dict[str, Any]
 ) -> tuple[str, AIMessage]:
-    question = _resolution_question(state)
-    result = json.dumps(
-        {
-            "success": False,
-            "error_type": "customer_resolution_required",
-            "retryable": False,
-            "resolution_status": "unresolved",
-            "message": question,
-        }
+    return customer_resolution.blocked_customer_write(
+        state, tool_call, parse_tool_result
     )
-    clarification_call = {
-        "name": "request_clarification",
-        "args": {"question": question},
-        "id": f"{tool_call['id']}-customer-resolution",
-        "type": "tool_call",
-    }
-    return result, AIMessage(content="", tool_calls=[clarification_call])
 
 
 def latest_customer_context(state: AgentState) -> dict[str, Any] | None:
-    for message in reversed(state["messages"]):
-        if not isinstance(message, ToolMessage):
-            continue
-        result = parse_tool_result(message.content)
-        customer = result.get("customer")
-        if isinstance(customer, dict):
-            return customer
-    return None
+    return customer_resolution.latest_customer_context(state, parse_tool_result)
 
 
 async def customer_context_for_recipient(
     state: AgentState, recipient: str
 ) -> dict[str, Any] | None:
-    customer = latest_customer_context(state)
-    if customer is not None:
-        recipient_clean = recipient.strip().lower()
-        verified_contacts = [
-            email.lower()
-            for field in ("billing_contact", "technical_contact")
-            for email in re.findall(
-                r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", str(customer.get(field, ""))
-            )
-        ]
-        if recipient_clean in verified_contacts:
-            return customer
-    result = parse_tool_result(await call_find_customer_by_contact(recipient))
-    customer = result.get("customer")
-    return customer if isinstance(customer, dict) else None
+    return await customer_resolution.customer_context_for_recipient(
+        state,
+        recipient,
+        parse_tool_result=parse_tool_result,
+        call_find_customer_by_contact=call_find_customer_by_contact,
+    )
 
 
 def _canonical_customer_args(
     state: AgentState, tool_call: dict[str, Any]
 ) -> dict[str, Any]:
-    """Send customer-scoped calls under the resolved customer's legal name.
-
-    Customer lookup accepts abbreviations such as "Acme Corp"; the project and
-    invoice tools match names exactly. Once identity is resolved for this run,
-    the canonical legal name is used instead of the model's wording.
-    """
-    if not state.get("business_checks") or tool_call["name"] not in {
-        "list_projects",
-        "create_project",
-        "list_invoices",
-        "log_invoice",
-    }:
-        return tool_call
-    reference = tool_call["args"].get("customer_name")
-    resolution = state.get("customer_resolution")
-    customer = resolution.get("customer") if resolution else None
-    legal_name = customer.get("legal_name") if isinstance(customer, dict) else None
-    if (
-        not isinstance(reference, str)
-        or not legal_name
-        or not _resolution_matches_reference(state, resolution, reference)
-    ):
-        return tool_call
-    return {**tool_call, "args": {**tool_call["args"], "customer_name": legal_name}}
+    return customer_resolution.canonical_customer_args(
+        state,
+        tool_call,
+        scoped_customer_tools={
+            "list_projects",
+            "create_project",
+            "list_invoices",
+            "log_invoice",
+        },
+        resolution_matches=_resolution_matches_reference,
+    )
 
 
 def _run_project_ids(state: AgentState, customer_id: Any) -> set[int]:
@@ -979,32 +638,14 @@ def _run_project_ids(state: AgentState, customer_id: Any) -> set[int]:
     }
 
 
+def _action_signature(tool_name: str, arguments: dict[str, Any]) -> str:
+    return execution_support.action_signature(tool_name, arguments)
+
+
 def _unexecuted_tool_messages(
     state: AgentState, answered: list[ToolMessage]
 ) -> list[ToolMessage]:
-    """Answer tool calls skipped by an early stop so every tool_call has a result.
-
-    The chat API rejects a conversation in which an assistant tool call has no
-    matching tool message, which happens when a guard blocks one call of a
-    parallel batch and the rest are never executed.
-    """
-    answered_ids = {message.tool_call_id for message in answered}
-    skipped = json.dumps(
-        {
-            "success": False,
-            "error_type": "not_executed",
-            "retryable": False,
-            "message": (
-                "Not executed because an earlier tool call in the same step was "
-                "blocked or stopped the run. Re-issue it if it is still needed."
-            ),
-        }
-    )
-    return [
-        ToolMessage(content=skipped, tool_call_id=call["id"])
-        for call in state["messages"][-1].tool_calls
-        if call["id"] not in answered_ids
-    ]
+    return execution_support.unexecuted_tool_messages(state, answered)
 
 
 async def execute_tool(state: AgentState) -> dict:
@@ -1060,9 +701,8 @@ async def execute_tool(state: AgentState) -> dict:
             execution_stop_reason = "smoke_read_only"
             break
 
-        action_signature = json.dumps(
-            {"tool": tool_call["name"], "args": tool_call["args"]},
-            sort_keys=True,
+        action_signature = _action_signature(
+            tool_call["name"], tool_call["args"]
         )
         if action_signature == last_action_signature:
             consecutive_action_count += 1
@@ -1540,345 +1180,75 @@ def approval(state: AgentState) -> dict:
 
 
 def _last_onboarding_writes(state: AgentState) -> list[tuple[dict[str, Any], dict[str, Any]]]:
-    """Pair successful project/task calls with their direct execution results."""
-    last_calls: list[dict[str, Any]] = []
-    for message in reversed(state["messages"]):
-        if isinstance(message, AIMessage):
-            last_calls = message.tool_calls
-            break
-    results = (state.get("last_tool_result") or {}).get("tools", [])
-    writes = []
-    for tool_call, result in zip(last_calls, results):
-        if (
-            tool_call["name"] in ONBOARDING_WRITE_TOOLS
-            and result.get("tool") == tool_call["name"]
-            and parse_tool_result(result.get("content", "")).get("success") is True
-        ):
-            writes.append((tool_call, result))
-    return writes
+    return onboarding_write_verification.last_onboarding_writes(
+        state, parse_tool_result, ONBOARDING_WRITE_TOOLS
+    )
 
 
 def _resolved_customer_for_onboarding_verification(
     state: AgentState, customer_name: str | None = None
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """Return run-bound customer evidence and an MCP lookup reference."""
-    resolution = state.get("customer_resolution")
-    if not _resolution_matches_reference(state, resolution, customer_name):
-        return None, None
-    customer = resolution.get("customer") if resolution else None
-    if not isinstance(customer, dict) or not isinstance(customer.get("id"), int):
-        return None, None
-    reference = customer.get("legal_name") or customer.get("name")
-    return (customer, reference) if isinstance(reference, str) and reference else (None, None)
+    return onboarding_write_verification._resolved_customer(
+        state, customer_name, _resolution_matches_reference
+    )
 
 
 def _observed_project_for_customer(
     state: AgentState, project_id: int, customer_id: int
 ) -> bool:
-    """Require a task's project ID to come from prior persisted tool evidence."""
-    for message in state["messages"]:
-        if not isinstance(message, ToolMessage):
-            continue
-        result = parse_tool_result(message.content)
-        candidates = []
-        if isinstance(result.get("project"), dict):
-            candidates.append(result["project"])
-        if isinstance(result.get("projects"), list):
-            candidates.extend(result["projects"])
-        if any(
-            isinstance(project, dict)
-            and project.get("id") == project_id
-            and project.get("customer_id") == customer_id
-            for project in candidates
-        ):
-            return True
-    return False
+    return onboarding_write_verification._observed_project(
+        state, project_id, customer_id, parse_tool_result
+    )
 
 
 async def _verify_created_project(
     state: AgentState, action: dict[str, Any], execution: dict[str, Any]
 ) -> dict[str, Any]:
-    created = execution.get("project")
-    customer, customer_reference = _resolved_customer_for_onboarding_verification(
-        state, action["args"].get("customer_name")
+    return await onboarding_write_verification.verify_created_project(
+        state,
+        action,
+        execution,
+        parse_tool_result=parse_tool_result,
+        call_list_projects=call_list_projects,
+        resolution_matches_reference=_resolution_matches_reference,
     )
-    if not isinstance(created, dict) or customer is None or customer_reference is None:
-        return {
-            "status": "FAIL",
-            "kind": "project",
-            "reason": "missing_execution_evidence",
-        }
-    project_id = created.get("id")
-    created_customer_id = created.get("customer_id")
-    if not isinstance(project_id, int) or not isinstance(created_customer_id, int):
-        return {
-            "status": "FAIL",
-            "kind": "project",
-            "reason": "missing_project_identifier",
-        }
-    try:
-        read_result = parse_tool_result(await call_list_projects(customer_reference))
-    except Exception:
-        read_result = {}
-    projects = read_result.get("projects")
-    actual = next(
-        (
-            project
-            for project in projects
-            if isinstance(project, dict) and project.get("id") == project_id
-        ),
-        None,
-    ) if read_result.get("success") is True and isinstance(projects, list) else None
-    if not isinstance(actual, dict):
-        return {
-            "status": "FAIL",
-            "kind": "project",
-            "reason": "project_not_found",
-            "project_id": project_id,
-        }
-    expected = {
-        "id": project_id,
-        "customer_id": customer["id"],
-        "name": action["args"].get("name"),
-        "status": created.get("status"),
-    }
-    mismatches = {
-        field: {"expected": value, "actual": actual.get(field)}
-        for field, value in expected.items()
-        if actual.get(field) != value
-    }
-    if created_customer_id != customer["id"]:
-        mismatches["creation_customer_id"] = {
-            "expected": customer["id"],
-            "actual": created_customer_id,
-        }
-    if mismatches:
-        return {
-            "status": "FAIL",
-            "kind": "project",
-            "reason": next(iter(mismatches)),
-            "mismatches": mismatches,
-        }
-    return {"status": "PASS", "kind": "project", "project_id": project_id}
 
 
 async def _verify_created_task(
     state: AgentState, action: dict[str, Any], execution: dict[str, Any]
 ) -> dict[str, Any]:
-    created = execution.get("task")
-    customer, customer_reference = _resolved_customer_for_onboarding_verification(state)
-    if not isinstance(created, dict) or customer is None or customer_reference is None:
-        return {
-            "status": "FAIL",
-            "kind": "task",
-            "reason": "missing_execution_evidence",
-        }
-    task_id = created.get("id")
-    project_id = action["args"].get("project_id")
-    if not isinstance(task_id, int) or not isinstance(project_id, int):
-        return {
-            "status": "FAIL",
-            "kind": "task",
-            "reason": "missing_task_identifier",
-        }
-    if created.get("project_id") != project_id:
-        return {
-            "status": "FAIL",
-            "kind": "task",
-            "reason": "creation_project_id",
-            "mismatches": {
-                "project_id": {
-                    "expected": project_id,
-                    "actual": created.get("project_id"),
-                }
-            },
-        }
-    if not _observed_project_for_customer(state, project_id, customer["id"]):
-        return {
-            "status": "FAIL",
-            "kind": "task",
-            "reason": "unobserved_project_id",
-            "project_id": project_id,
-        }
-    try:
-        project_result = parse_tool_result(await call_list_projects(customer_reference))
-    except Exception:
-        project_result = {}
-    projects = project_result.get("projects")
-    project = next(
-        (
-            item
-            for item in projects
-            if isinstance(item, dict)
-            and item.get("id") == project_id
-            and item.get("customer_id") == customer["id"]
-        ),
-        None,
-    ) if project_result.get("success") is True and isinstance(projects, list) else None
-    if not isinstance(project, dict):
-        return {
-            "status": "FAIL",
-            "kind": "task",
-            "reason": "project_not_found_or_wrong_customer",
-            "project_id": project_id,
-        }
-    try:
-        task_result = parse_tool_result(await call_list_tasks(project_id))
-    except Exception:
-        task_result = {}
-    tasks = task_result.get("tasks")
-    actual = next(
-        (
-            task
-            for task in tasks
-            if isinstance(task, dict) and task.get("id") == task_id
-        ),
-        None,
-    ) if task_result.get("success") is True and isinstance(tasks, list) else None
-    if not isinstance(actual, dict):
-        return {
-            "status": "FAIL",
-            "kind": "task",
-            "reason": "task_not_found",
-            "task_id": task_id,
-        }
-    expected = {
-        "id": task_id,
-        "project_id": project_id,
-        "title": action["args"].get("title"),
-        "status": created.get("status"),
-    }
-    mismatches = {
-        field: {"expected": value, "actual": actual.get(field)}
-        for field, value in expected.items()
-        if actual.get(field) != value
-    }
-    if mismatches:
-        return {
-            "status": "FAIL",
-            "kind": "task",
-            "reason": next(iter(mismatches)),
-            "mismatches": mismatches,
-        }
-    return {"status": "PASS", "kind": "task", "task_id": task_id, "project_id": project_id}
+    return await onboarding_write_verification.verify_created_task(
+        state,
+        action,
+        execution,
+        parse_tool_result=parse_tool_result,
+        call_list_projects=call_list_projects,
+        call_list_tasks=call_list_tasks,
+        resolution_matches_reference=_resolution_matches_reference,
+    )
 
 
 async def verify_onboarding(state: AgentState) -> dict:
-    """Read back successful onboarding writes without proposing corrective writes."""
-    writes = _last_onboarding_writes(state)
-    if not writes:
-        evidence = {
-            "status": "FAIL",
-            "reason": "missing_execution_evidence",
-        }
-    else:
-        evidence_items = []
-        for action, result in writes:
-            execution = parse_tool_result(result["content"])
-            if action["name"] == "create_project":
-                evidence = await _verify_created_project(state, action, execution)
-            else:
-                evidence = await _verify_created_task(state, action, execution)
-            evidence_items.append(evidence)
-            if evidence["status"] == "FAIL":
-                break
-        else:
-            previous = state.get("onboarding_verification_result") or {}
-            previous_writes = (
-                previous.get("writes", []) if previous.get("status") == "PASS" else []
-            )
-            evidence = {"status": "PASS", "writes": [*previous_writes, *evidence_items]}
-    return {
-        "onboarding_verification_result": evidence,
-        "execution_stop_reason": (
-            "onboarding_verification_failed" if evidence["status"] == "FAIL" else None
-        ),
-    }
+    return await onboarding_write_verification.verify_onboarding(
+        state,
+        parse_tool_result=parse_tool_result,
+        call_list_projects=call_list_projects,
+        call_list_tasks=call_list_tasks,
+        resolution_matches_reference=_resolution_matches_reference,
+        onboarding_write_tools=ONBOARDING_WRITE_TOOLS,
+    )
 
 
 def _latest_email_action(state: AgentState) -> dict[str, Any] | None:
-    for message in reversed(state["messages"]):
-        if not isinstance(message, AIMessage):
-            continue
-        for tool_call in reversed(message.tool_calls):
-            if tool_call["name"] == "send_email":
-                return tool_call
-    return None
+    return communication_verification.latest_email_action(state)
 
 
 async def verify(state: AgentState) -> dict:
-    """Read the configured backend's email record and compare it with the intended action."""
-    action = _latest_email_action(state)
-    tool_result = next(
-        (
-            item
-            for item in reversed(state["last_tool_result"]["tools"])
-            if item["tool"] == "send_email"
-        ),
-        None,
+    return await communication_verification.verify(
+        state,
+        parse_tool_result=parse_tool_result,
+        call_get_email=call_get_email,
     )
-    if action is None or tool_result is None:
-        return {
-            "verification_result": {
-                "status": "FAIL",
-                "reason": "missing_execution_evidence",
-            },
-            "execution_stop_reason": "communication_verification_failed",
-        }
-
-    execution = parse_tool_result(tool_result["content"])
-    email_id = execution.get("email_id")
-    backend = execution.get("backend", "mock")
-    if not isinstance(email_id, (int, str)):
-        return {
-            "verification_result": {
-                "status": "FAIL",
-                "reason": "missing_email_id",
-                "backend": backend,
-            },
-            "execution_stop_reason": "communication_verification_failed",
-        }
-
-    actual_result = parse_tool_result(await call_get_email(email_id))
-    actual = actual_result.get("email")
-    expected = {
-        "recipient": action["args"]["to"],
-        "subject": action["args"]["subject"],
-        "body": action["args"]["body"],
-        "status": "sent",
-    }
-    if not actual_result.get("success") or not isinstance(actual, dict):
-        evidence = {
-            "status": "FAIL",
-            "reason": "email_not_found",
-            "email_id": email_id,
-            "backend": backend,
-        }
-    else:
-        mismatches = {
-            field: {"expected": expected[field], "actual": actual.get(field)}
-            for field in expected
-            if actual.get(field) != expected[field]
-        }
-        evidence = (
-            {
-                "status": "FAIL",
-                "reason": next(iter(mismatches)),
-                "mismatches": mismatches,
-                "backend": backend,
-            }
-            if mismatches
-            else {"status": "PASS", "email_id": email_id, "backend": backend}
-        )
-
-    return {
-        "verification_result": evidence,
-        "execution_stop_reason": (
-            "communication_verification_failed"
-            if evidence["status"] == "FAIL"
-            else None
-        ),
-    }
 
 
 def _latest_invoice_action(state: AgentState) -> dict[str, Any] | None:
@@ -1964,217 +1334,41 @@ async def verify_invoice(state: AgentState) -> dict:
 
 
 def _is_invoice_reconciliation_goal(state: AgentState) -> bool:
-    """Recognize the narrow, read-only invoice consistency workflow."""
-    goal = state.get("goal", "").casefold()
-    return "invoice" in goal and any(
-        word in goal for word in ("verify", "verification", "reconcile", "reconciliation")
-    )
+    return invoice_reconciliation.is_invoice_reconciliation_goal(state)
 
 
 def _should_run_invoice_reconciliation(state: AgentState) -> bool:
-    return (
-        _is_invoice_reconciliation_goal(state)
-        and state.get("invoice_reconciliation_result") is None
-        and not state.get("execution_stop_reason")
-    )
+    return invoice_reconciliation.should_run_invoice_reconciliation(state)
 
 
 def _latest_tool_observation(
     state: AgentState, tool_name: str
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """Return the latest successful tool payload and its original call."""
-    calls: dict[str, dict[str, Any]] = {}
-    observations: list[tuple[dict[str, Any], dict[str, Any]]] = []
-    for message in state.get("messages", []):
-        if isinstance(message, AIMessage):
-            calls.update({call["id"]: call for call in message.tool_calls})
-        elif isinstance(message, ToolMessage):
-            call = calls.get(message.tool_call_id)
-            if call and call.get("name") == tool_name:
-                payload = parse_tool_result(message.content)
-                if payload.get("success") is True:
-                    observations.append((payload, call))
-    return observations[-1] if observations else (None, None)
+    return invoice_reconciliation.latest_tool_observation(
+        state, tool_name, parse_tool_result
+    )
 
 
 def _document_invoice_value(content: str, label: str) -> str | None:
-    match = re.search(
-        rf"\*\*{re.escape(label)}\*\*\s*\|\s*([^|\n]+)",
-        content,
-        re.IGNORECASE,
-    )
-    return match.group(1).strip().strip("*").strip() if match else None
+    return invoice_reconciliation.document_invoice_value(content, label)
 
 
 def _normalized_amount(value: Any) -> str | None:
-    try:
-        return format(Decimal(re.sub(r"[^0-9.-]", "", str(value))), ".2f")
-    except (InvalidOperation, ValueError):
-        return None
+    return invoice_reconciliation.normalized_amount(value)
 
 
 def _normalized_document_date(value: str | None) -> str | None:
-    if not value:
-        return None
-    try:
-        return datetime.strptime(value.strip(), "%B %d, %Y").date().isoformat()
-    except ValueError:
-        return None
+    return invoice_reconciliation.normalized_document_date(value)
 
 
 async def reconcile_invoice(state: AgentState) -> dict:
-    """Read-only consistency check of an active invoice and its source document.
-
-    This is intentionally separate from ``verify_invoice``, which proves a
-    log_invoice write persisted. Reconciliation compares the selected current
-    database record to the available invoice Markdown source; it cannot prove
-    commercial or legal correctness beyond those two internal sources.
-    """
-    listed, list_call = _latest_tool_observation(state, "list_invoices")
-    selected, selected_call = _latest_tool_observation(state, "get_invoice")
-    if listed is None or selected is None or selected_call is None:
-        evidence = {
-            "status": "INSUFFICIENT_EVIDENCE",
-            "reason": "missing_invoice_selection_evidence",
-            "fields": [],
-        }
-    else:
-        current = listed.get("current_invoice")
-        selected_id = selected_call.get("args", {}).get("invoice_id")
-        invoice = selected.get("invoice")
-        if not isinstance(current, dict) or not isinstance(invoice, dict) or not isinstance(selected_id, int):
-            evidence = {
-                "status": "INSUFFICIENT_EVIDENCE",
-                "reason": "incomplete_invoice_observation",
-                "fields": [],
-            }
-        else:
-            try:
-                persisted_result = parse_tool_result(await call_get_invoice(selected_id))
-            except Exception:
-                persisted_result = {}
-            persisted = persisted_result.get("invoice")
-            if persisted_result.get("success") is not True or not isinstance(persisted, dict):
-                evidence = {
-                    "status": "INSUFFICIENT_EVIDENCE",
-                    "reason": "persisted_invoice_not_found",
-                    "invoice_id": selected_id,
-                    "fields": [],
-                }
-            else:
-                try:
-                    search = json.loads(
-                        await call_search_documents(
-                            f"{persisted.get('invoice_number', '')} invoice"
-                        )
-                    )
-                except (TypeError, json.JSONDecodeError):
-                    search = []
-                source = next(
-                    (
-                        item.get("source")
-                        for item in search if isinstance(item, dict)
-                        and isinstance(item.get("source"), str)
-                        and item["source"].startswith("invoices/")
-                    ),
-                    None,
-                )
-                try:
-                    document_result = (
-                        parse_tool_result(await call_read_document(source))
-                        if isinstance(source, str)
-                        else {}
-                    )
-                except Exception:
-                    document_result = {}
-                content = document_result.get("content")
-                if document_result.get("success") is not True or not isinstance(content, str):
-                    evidence = {
-                        "status": "INSUFFICIENT_EVIDENCE",
-                        "reason": "authoritative_invoice_document_unavailable",
-                        "invoice_id": selected_id,
-                        "fields": [],
-                    }
-                else:
-                    expected = {
-                        "invoice_number": _document_invoice_value(content, "Invoice Number"),
-                        "amount": _normalized_amount(_document_invoice_value(content, "Total Amount Due")),
-                        "due_date": _normalized_document_date(
-                            _document_invoice_value(content, "Payment Due Date")
-                        ),
-                        "customer_name": _document_invoice_value(content, "Customer Legal Name"),
-                        "revision_status": _document_invoice_value(content, "Revision Status"),
-                    }
-                    if any(value is None for value in expected.values()):
-                        evidence = {
-                            "status": "INSUFFICIENT_EVIDENCE",
-                            "reason": "authoritative_invoice_document_incomplete",
-                            "source": source,
-                            "fields": [],
-                        }
-                    else:
-                        actual = {
-                            "invoice_number": persisted.get("invoice_number"),
-                            "amount": _normalized_amount(persisted.get("amount")),
-                            "due_date": persisted.get("due_date"),
-                            "customer_name": persisted.get("customer_name"),
-                        }
-                        checks = [
-                            {
-                                "field": field,
-                                "expected": expected[field],
-                                "actual": actual[field],
-                                "matched": str(expected[field]).casefold()
-                                == str(actual[field]).casefold(),
-                            }
-                            for field in actual
-                        ]
-                        revision_expected = expected["revision_status"]
-                        revision_matches = (
-                            persisted.get("id") == current.get("id")
-                            and current.get("status") == "active"
-                            and persisted.get("status") == "active"
-                            and "active" in revision_expected.casefold()
-                            and (
-                                "supersedes" not in revision_expected.casefold()
-                                or (
-                                    isinstance(persisted.get("supersedes_invoice_number"), str)
-                                    and persisted.get("revision_number", 0) > 0
-                                )
-                            )
-                        )
-                        checks.append(
-                            {
-                                "field": "current_revision",
-                                "expected": revision_expected,
-                                "actual": {
-                                    "selected_invoice_id": persisted.get("id"),
-                                    "current_invoice_id": current.get("id"),
-                                    "status": persisted.get("status"),
-                                    "revision_number": persisted.get("revision_number"),
-                                    "supersedes_invoice_number": persisted.get("supersedes_invoice_number"),
-                                },
-                                "matched": revision_matches,
-                            }
-                        )
-                        evidence = {
-                            "status": "VERIFIED" if all(check["matched"] for check in checks) else "FAILED",
-                            "source": source,
-                            "invoice_id": selected_id,
-                            "current_invoice_id": current.get("id"),
-                            "fields": checks,
-                        }
-    stop_reason = (
-        None
-        if evidence["status"] == "VERIFIED"
-        else "invoice_reconciliation_insufficient_evidence"
-        if evidence["status"] == "INSUFFICIENT_EVIDENCE"
-        else "invoice_reconciliation_failed"
+    return await invoice_reconciliation.reconcile_invoice(
+        state,
+        parse_tool_result=parse_tool_result,
+        call_get_invoice=call_get_invoice,
+        call_search_documents=call_search_documents,
+        call_read_document=call_read_document,
     )
-    return {
-        "invoice_reconciliation_result": evidence,
-        "execution_stop_reason": stop_reason,
-    }
 
 
 def repair(state: AgentState) -> dict:
@@ -2284,313 +1478,74 @@ def _should_run_completion_check(state: AgentState) -> bool:
 
 
 def _json_object(text: str) -> dict[str, Any]:
-    start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end <= start:
-        raise ValueError("no JSON object in model output")
-    parsed = json.loads(text[start : end + 1])
-    if not isinstance(parsed, dict):
-        raise ValueError("model output is not a JSON object")
-    return parsed
+    return onboarding_verification.json_object(text)
 
 
 async def _completion_documents(state: AgentState, legal_name: str) -> dict[str, str]:
-    """Read whole governing documents so the review is not limited to search snippets."""
-    legal = " ".join(legal_name.casefold().split())
-    candidates: list[str] = []
-
-    def collect(chunks: Any) -> None:
-        for chunk in chunks if isinstance(chunks, list) else []:
-            source = chunk.get("source") if isinstance(chunk, dict) else None
-            if (
-                isinstance(source, str)
-                and source.startswith("contracts/")
-                and source not in candidates
-            ):
-                candidates.append(source)
-
-    collect(_search_results(state))
-    if not candidates:
-        try:
-            collect(json.loads(await call_search_documents(f"{legal_name} contract")))
-        except (TypeError, json.JSONDecodeError):
-            pass
-
-    documents: dict[str, str] = {}
-    for source in candidates[:4]:
-        payload = parse_tool_result(await call_read_document(source))
-        content = payload.get("content")
-        if (
-            payload.get("success") is True
-            and isinstance(content, str)
-            and legal in " ".join(content.casefold().split())
-        ):
-            documents[source] = content[:MAX_COMPLETION_DOC_CHARS]
-    if not documents:
-        raise RuntimeError(f"governing contract for {legal_name} not found")
-    for source in COMPLETION_REFERENCE_DOCS:
-        payload = parse_tool_result(await call_read_document(source))
-        if payload.get("success") is True and isinstance(payload.get("content"), str):
-            documents[source] = payload["content"][:MAX_COMPLETION_DOC_CHARS]
-    return documents
+    return await onboarding_verification.completion_documents(
+        _search_results(state),
+        legal_name,
+        parse_tool_result=parse_tool_result,
+        call_search_documents=call_search_documents,
+        call_read_document=call_read_document,
+        reference_documents=COMPLETION_REFERENCE_DOCS,
+        max_document_chars=MAX_COMPLETION_DOC_CHARS,
+    )
 
 
 async def _completion_actual_tasks(
     legal_name: str, project_ids: set[int]
 ) -> list[dict[str, Any]]:
-    """Read persisted tasks of the projects this run worked on, via Operations."""
-    if not project_ids:
-        return []
-    projects_result = parse_tool_result(await call_list_projects(legal_name))
-    projects = projects_result.get("projects")
-    if projects_result.get("success") is not True or not isinstance(projects, list):
-        raise RuntimeError("could not list the customer's onboarding projects")
-    rows: list[dict[str, Any]] = []
-    for project in projects:
-        if (
-            not isinstance(project, dict)
-            or not isinstance(project.get("id"), int)
-            or project["id"] not in project_ids
-        ):
-            continue
-        tasks_result = parse_tool_result(await call_list_tasks(project["id"]))
-        tasks = tasks_result.get("tasks")
-        if tasks_result.get("success") is not True or not isinstance(tasks, list):
-            raise RuntimeError("could not list onboarding tasks")
-        for task in tasks:
-            if isinstance(task, dict) and isinstance(task.get("id"), int):
-                rows.append(
-                    {
-                        "task_id": task["id"],
-                        "project": project.get("name"),
-                        "title": task.get("title"),
-                        "status": task.get("status"),
-                    }
-                )
-    return rows
+    return await onboarding_verification.completion_actual_tasks(
+        legal_name,
+        project_ids,
+        parse_tool_result=parse_tool_result,
+        call_list_projects=call_list_projects,
+        call_list_tasks=call_list_tasks,
+    )
 
 
-COMPLETION_REVIEW_PROMPT = """You are an independent reviewer of customer onboarding completeness. You see only the customer's governing documents and the onboarding tasks that currently exist. You do not see how those tasks were created.
-
-From the documents, list the internal work items Northstar staff must perform, review, approve or escalate for THIS customer's onboarding. Include:
-- reviews, assessments, approvals and escalations that the SOP or policies make mandatory because of facts in this customer's contract (tier, seat or volume thresholds, regulated data, data residency, start or go-live timing, special or unusual commitments);
-- mandatory items stated directly in the contract.
-Exclude requirements that do not apply to this customer's facts, outbound customer emails, and anything that concerns other customers. If several agreements exist, use only the current executed one that names this legal entity and ignore superseded or expired ones.
-
-For each item decide whether one existing task clearly covers it. A task covers an item only if its title names that work.
-
-Respond with JSON only, no commentary:
-{"required_items": [{"item": "short name", "basis": "document and clause requiring it, under 25 words", "satisfied_by_task_id": <existing task id or null>}]}"""
-
-
-# These words describe generic project administration rather than evidence that
-# a task covers a customer-specific requirement.  A title must still contain
-# meaningful terms from the individual requirement before a reviewer claim can
-# count as completion evidence.
-_COMPLETION_GENERIC_TERMS = {
-    "a",
-    "an",
-    "and",
-    "assessment",
-    "customer",
-    "for",
-    "initial",
-    "mandatory",
-    "onboarding",
-    "review",
-    "setup",
-    "task",
-    "the",
-    "to",
-    "verification",
-    "work",
-}
+_COMPLETION_GENERIC_TERMS = onboarding_verification._COMPLETION_GENERIC_TERMS
 
 
 def _completion_terms(text: Any) -> set[str]:
-    """Return non-generic title terms used to validate a coverage claim."""
-    terms = set()
-    for term in re.findall(r"[a-z0-9]+", str(text).casefold()):
-        if term.endswith("s") and len(term) > 4:
-            term = term[:-1]
-        if term not in _COMPLETION_GENERIC_TERMS and len(term) > 2:
-            terms.add(term)
-    return terms
+    return onboarding_verification.completion_terms(text)
 
 
 def _task_coverage_evidence(item: str, task: dict[str, Any]) -> dict[str, Any]:
-    """Validate a reviewer claim against the actual persisted task title.
-
-    The LLM identifies contract-derived requirements, but it cannot turn an
-    existing generic task into evidence of every requirement.  For a title to
-    satisfy an item, it must explicitly share the item's substantive terms.
-    A one-term item (for example, security review) needs that one distinctive
-    term; richer items need at least two.  This permits one explicitly scoped
-    task to cover multiple items without treating a generic setup task as a
-    universal match.
-    """
-    requirement_terms = _completion_terms(item)
-    title = str(task.get("title", ""))
-    title_terms = _completion_terms(title)
-    matched_terms = sorted(requirement_terms & title_terms)
-    required_matches = min(2, len(requirement_terms))
-    covered = bool(requirement_terms) and len(matched_terms) >= required_matches
-    return {
-        "covered": covered,
-        "task_title": title,
-        "matched_terms": matched_terms,
-        "required_terms": sorted(requirement_terms),
-    }
+    return onboarding_verification.task_coverage_evidence(item, task)
 
 
 async def _review_requirements(
     legal_name: str, documents: dict[str, str], tasks: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    task_lines = (
-        "\n".join(
-            f"- id {task['task_id']}: {task['title']} [{task['status']}] "
-            f"(project: {task['project']})"
-            for task in tasks
-        )
-        or "(no tasks exist)"
+    return await onboarding_verification.review_requirements(
+        legal_name,
+        documents,
+        tasks,
+        get_llm=get_llm,
+        max_items=MAX_COMPLETION_ITEMS,
     )
-    document_text = "\n\n".join(
-        f"### DOCUMENT: {source}\n{content}" for source, content in documents.items()
-    )
-    response = await get_llm().ainvoke(
-        [
-            SystemMessage(content=COMPLETION_REVIEW_PROMPT),
-            HumanMessage(
-                content=(
-                    f"Customer legal entity: {legal_name}\n\n"
-                    f"Existing onboarding tasks:\n{task_lines}\n\n{document_text}"
-                )
-            ),
-        ]
-    )
-    items = _json_object(str(response.content)).get("required_items")
-    if not isinstance(items, list):
-        raise ValueError("required_items missing from reviewer output")
-    tasks_by_id = {
-        task["task_id"]
-        : task
-        for task in tasks
-        if isinstance(task.get("task_id"), int)
-    }
-    reviewed: list[dict[str, Any]] = []
-    for item in items[:MAX_COMPLETION_ITEMS]:
-        if not isinstance(item, dict) or not str(item.get("item", "")).strip():
-            continue
-        claimed = item.get("satisfied_by_task_id")
-        requirement = str(item["item"]).strip()
-        task = tasks_by_id.get(claimed) if isinstance(claimed, int) else None
-        evidence = (
-            _task_coverage_evidence(requirement, task)
-            if task is not None
-            else {
-                "covered": False,
-                "task_title": None,
-                "matched_terms": [],
-                "required_terms": sorted(_completion_terms(requirement)),
-            }
-        )
-        reviewed.append(
-            {
-                "item": requirement,
-                "basis": str(item.get("basis", ""))[:300],
-                # A reviewer claim counts only when the persisted title also
-                # provides requirement-specific coverage evidence.
-                "satisfied_by_task_id": (
-                    claimed if task is not None and evidence["covered"] else None
-                ),
-                "coverage_evidence": evidence,
-            }
-        )
-    return reviewed
 
 
 async def verify_requirements(state: AgentState) -> dict:
-    """Compare persisted onboarding tasks with contract/SOP requirements.
-
-    The reviewer reads the governing documents in full and the persisted
-    tasks. It never sees the agent's own reasoning. Missing items send the run
-    back to planning a bounded number of times, then the run stops and reports
-    them instead of claiming completion.
-    """
-    attempt = state.get("completion_check_count", 0) + 1
-    legal_name = state["customer_resolution"]["customer"]["legal_name"]
-    try:
-        documents = await _completion_documents(state, legal_name)
-        tasks = await _completion_actual_tasks(
-            legal_name,
-            _run_project_ids(state, state["customer_resolution"]["customer"].get("id")),
-        )
-        reviewed = await _review_requirements(legal_name, documents, tasks)
-    except Exception as error:
-        return {
-            "onboarding_completion_result": {
-                "status": "SKIPPED",
-                "attempt": attempt,
-                "reason": f"{type(error).__name__}: {error}"[:200],
-            },
-            "completion_check_count": attempt,
-        }
-
-    verification_evidence = [
-        {"source": source, "excerpt": content}
-        for source, content in documents.items()
-        if isinstance(source, str) and isinstance(content, str) and content.strip()
-    ]
-    missing = [item["item"] for item in reviewed if item["satisfied_by_task_id"] is None]
-    status = "SKIPPED" if not reviewed else ("FAIL" if missing else "PASS")
-    update: dict[str, Any] = {
-        "onboarding_completion_result": {
-            "status": status,
-            "attempt": attempt,
-            "required_items": reviewed,
-            "missing": missing,
-        },
-        "completion_check_count": attempt,
-        "verification_evidence": verification_evidence,
-    }
-    if status != "FAIL":
-        return update
-
-    listed = "; ".join(missing)
-    if attempt <= MAX_COMPLETION_REPAIRS:
-        update["messages"] = [
-            HumanMessage(
-                content=(
-                    "Independent completion check: the governing documents require "
-                    f"the following onboarding items, but no matching task exists: {listed}. "
-                    "The completion check has already independently inspected the "
-                    "current persisted tasks for this run's onboarding project. Reuse "
-                    "that evidence and create one internal task for each missing item; "
-                    "do not repeat list_tasks for the same project solely to rediscover "
-                    "these gaps. If an item needs a "
-                    "decision or approval from another role (for example Security, "
-                    "Finance or an operations lead), record it as a task whose title "
-                    "begins with 'Escalate:' (use 'Review:' for reviews or assessments that "
-                    "Northstar staff will carry out) and say in your final answer "
-                    "that it is pending, not done. Do not claim anything is complete "
-                    "that has not been done."
-                )
-            )
-        ]
-        return update
-
-    update["execution_stop_reason"] = "onboarding_requirements_incomplete"
-    update["messages"] = [
-        HumanMessage(
-            content=(
-                f"Independent completion check still found required onboarding items "
-                f"with no matching task after {MAX_COMPLETION_REPAIRS} repair "
-                f"attempts: {listed}. Report the onboarding status accurately: say "
-                "what was done, and list these as open items that need human action. "
-                "Do not claim onboarding is complete."
-            )
-        )
-    ]
-    return update
+    return await onboarding_verification.verify_requirements(
+        state,
+        search_results=_search_results(state),
+        project_ids=_run_project_ids(
+            state, state["customer_resolution"]["customer"].get("id")
+        ),
+        parse_tool_result=parse_tool_result,
+        call_search_documents=call_search_documents,
+        call_read_document=call_read_document,
+        call_list_projects=call_list_projects,
+        call_list_tasks=call_list_tasks,
+        get_llm=get_llm,
+        reference_documents=COMPLETION_REFERENCE_DOCS,
+        max_document_chars=MAX_COMPLETION_DOC_CHARS,
+        max_items=MAX_COMPLETION_ITEMS,
+        max_repairs=MAX_COMPLETION_REPAIRS,
+    )
 
 
 def route_after_completion_check(state: AgentState) -> str:
@@ -2601,56 +1556,15 @@ def route_after_completion_check(state: AgentState) -> str:
 
 
 def _format_reconciliation_value(value: Any) -> str:
-    """Render structured reconciliation evidence without losing its value."""
-    if isinstance(value, (dict, list)):
-        return json.dumps(value, sort_keys=True, default=str)
-    return str(value)
+    return invoice_reconciliation.format_reconciliation_value(value)
 
 
 def _invoice_reconciliation_final_response(
     evidence: dict[str, Any], execution_stop_reason: str | None
 ) -> str:
-    """Produce the authoritative final report for a completed reconciliation."""
-    status = evidence.get("status")
-    if status == "VERIFIED":
-        lines = [
-            "Invoice reconciliation VERIFIED.",
-            (
-                "The selected active persisted invoice matched the available "
-                "internal invoice document on the checked fields. This confirms "
-                "only consistency between those internal sources."
-            ),
-        ]
-    elif status == "FAILED":
-        lines = [
-            "Invoice reconciliation FAILED.",
-            "One or more checked fields differ, so the invoice is not verified.",
-        ]
-    else:
-        lines = [
-            "Invoice reconciliation has INSUFFICIENT_EVIDENCE.",
-            "The invoice is not verified because the required evidence was unavailable or incomplete.",
-        ]
-
-    for label in ("source", "invoice_id", "current_invoice_id", "reason"):
-        if evidence.get(label) is not None:
-            lines.append(f"{label.replace('_', ' ').capitalize()}: {_format_reconciliation_value(evidence[label])}")
-
-    fields = evidence.get("fields")
-    if isinstance(fields, list) and fields:
-        lines.append("Checked fields:")
-        for field in fields:
-            if not isinstance(field, dict):
-                continue
-            name = str(field.get("field", "unknown field"))
-            outcome = "PASS" if field.get("matched") is True else "FAIL"
-            expected = _format_reconciliation_value(field.get("expected"))
-            actual = _format_reconciliation_value(field.get("actual"))
-            lines.append(f"- {name}: {outcome} (expected: {expected}; actual: {actual})")
-
-    if execution_stop_reason:
-        lines.append(f"Execution stop reason: {execution_stop_reason}")
-    return "\n".join(lines)
+    return invoice_reconciliation.invoice_reconciliation_final_response(
+        evidence, execution_stop_reason
+    )
 
 
 async def answer(state: AgentState) -> dict:
