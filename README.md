@@ -155,3 +155,10 @@ company_data/       demo company, contract, policy and invoice documents
 tests/              unit and async regression tests
 docs/DESIGN.md      design notes and configuration reference
 ```
+
+## Submission and continued development
+
+The `main` branch contains the actual version submitted for evaluation. The
+modularized agent implementation developed after submission is available on
+the [`refactor/modularize-agent`](https://github.com/Sarada123-eng/NorthStar-Autonomous-Agent/tree/refactor/modularize-agent)
+branch and is documented separately from the submission.
